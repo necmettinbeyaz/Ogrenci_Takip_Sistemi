@@ -1,1230 +1,666 @@
 import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
 import sqlite3
+import pandas as pd
 import hashlib
-import uuid
 import random
+import string
+from datetime import datetime
+import plotly.express as px
+import plotly.graph_objects as go
+import io
 
-# ===================== VERİTABANI KATMANI =====================
+# --- SAYFA AYARLARI ---
+st.set_page_config(page_title="Öğrenci Takip Sistemi", layout="wide", page_icon="📚")
 
-DB_FILE = "student_tracking.db"
-
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
+# --- VERİTABANI BAĞLANTISI VE KURULUMU ---
+def get_db_connection():
+    conn = sqlite3.connect('ogrenci_takip.db', check_same_thread=False)
     return conn
 
 def init_db():
-    conn = get_db()
+    conn = get_db_connection()
     c = conn.cursor()
+    
+    # Kullanıcılar Tablosu
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
+                    role TEXT,
+                    email TEXT UNIQUE,
+                    phone TEXT,
+                    password TEXT,
+                    unique_id TEXT UNIQUE
+                )''')
+    
+    # İlişkiler (Öğretmen-Öğrenci, Veli-Öğrenci)
+    c.execute('''CREATE TABLE IF NOT EXISTS relationships (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    supervisor_id INTEGER, -- Öğretmen veya Veli ID
+                    student_id INTEGER,    -- Öğrenci ID
+                    type TEXT              -- 'ogretmen' veya 'veli'
+                )''')
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            phone TEXT,
-            password TEXT NOT NULL,
-            user_type TEXT NOT NULL,
-            unique_id TEXT UNIQUE,
-            is_admin INTEGER DEFAULT 0,
-            is_demo INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    # Dersler
+    c.execute('''CREATE TABLE IF NOT EXISTS subjects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    student_id INTEGER,
+                    subject_name TEXT
+                )''')
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS password_reset_tokens (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER,
-            token TEXT UNIQUE,
-            expires_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
+    # Üniteler
+    c.execute('''CREATE TABLE IF NOT EXISTS units (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject_id INTEGER,
+                    unit_name TEXT,
+                    is_completed INTEGER DEFAULT 0
+                )''')
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS courses (
-            id INTEGER PRIMARY KEY,
-            student_id INTEGER,
-            course_name TEXT NOT NULL,
-            is_demo INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(student_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
+    # Günlük Çalışma Kayıtları
+    c.execute('''CREATE TABLE IF NOT EXISTS study_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    student_id INTEGER,
+                    subject_id INTEGER,
+                    unit_id INTEGER,
+                    date TEXT,
+                    q_solved INTEGER,
+                    q_wrong INTEGER,
+                    q_empty INTEGER,
+                    duration INTEGER,
+                    is_repeated INTEGER DEFAULT 0
+                )''')
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS units (
-            id INTEGER PRIMARY KEY,
-            course_id INTEGER,
-            unit_name TEXT NOT NULL,
-            is_completed INTEGER DEFAULT 0,
-            repeat_count INTEGER DEFAULT 0,
-            is_demo INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE CASCADE
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS daily_entries (
-            id INTEGER PRIMARY KEY,
-            student_id INTEGER,
-            entry_date DATE,
-            course_id INTEGER,
-            unit_id INTEGER,
-            questions_solved INTEGER DEFAULT 0,
-            wrong_answers INTEGER DEFAULT 0,
-            empty_answers INTEGER DEFAULT 0,
-            duration_minutes INTEGER DEFAULT 0,
-            repeated INTEGER DEFAULT 0,
-            is_demo INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(student_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE CASCADE,
-            FOREIGN KEY(unit_id) REFERENCES units(id) ON DELETE CASCADE
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS exam_entries (
-            id INTEGER PRIMARY KEY,
-            student_id INTEGER,
-            exam_date DATE,
-            course_id INTEGER,
-            questions_solved INTEGER DEFAULT 0,
-            wrong_answers INTEGER DEFAULT 0,
-            empty_answers INTEGER DEFAULT 0,
-            duration_minutes INTEGER DEFAULT 0,
-            is_demo INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(student_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE CASCADE
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS teacher_students (
-            id INTEGER PRIMARY KEY,
-            teacher_id INTEGER,
-            student_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(teacher_id, student_id),
-            FOREIGN KEY(teacher_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY(student_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS parent_students (
-            id INTEGER PRIMARY KEY,
-            parent_id INTEGER,
-            student_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(parent_id, student_id),
-            FOREIGN KEY(parent_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY(student_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
-
+    # Deneme Sınavı Kayıtları
+    c.execute('''CREATE TABLE IF NOT EXISTS exam_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    student_id INTEGER,
+                    subject_id INTEGER, -- Ders bazlı deneme
+                    date TEXT,
+                    q_solved INTEGER,
+                    q_wrong INTEGER,
+                    q_empty INTEGER,
+                    duration INTEGER
+                )''')
+    
+    # Admin02 Varsayılan Kullanıcı
+    c.execute("SELECT * FROM users WHERE email='admin02'")
+    if not c.fetchone():
+        # Şifre: admin02
+        hashed_pw = hashlib.sha256("admin02".encode()).hexdigest()
+        c.execute("INSERT INTO users (name, role, email, phone, password, unique_id) VALUES (?, ?, ?, ?, ?, ?)",
+                  ("Sistem Yöneticisi", "Yönetici", "admin02", "000", hashed_pw, "ADMIN1"))
+        
     conn.commit()
     conn.close()
 
-def hash_password(p):
-    return hashlib.sha256(p.encode()).hexdigest()
+# --- YARDIMCI FONKSİYONLAR ---
 
 def generate_unique_id():
-    return str(uuid.uuid4())[:6].upper()
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
-def generate_reset_token():
-    return str(uuid.uuid4())
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
-def add_user(name, email, phone, password, user_type, is_demo=False):
-    try:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO users (name,email,phone,password,user_type,unique_id,is_demo)
-               VALUES (?,?,?,?,?,?,?)""",
-            (name, email, phone, hash_password(password), user_type, generate_unique_id(), int(is_demo)),
-        )
-        conn.commit()
-        uid = c.lastrowid
-        conn.close()
-        return uid
-    except sqlite3.IntegrityError:
-        return None
+def check_password(password, hashed):
+    return hash_password(password) == hashed
 
-def verify_user(email, password):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "SELECT id,name,email,user_type,unique_id,is_admin FROM users WHERE email=? AND password=?",
-        (email, hash_password(password)),
-    )
-    u = c.fetchone()
-    conn.close()
-    if u:
-        return {
-            "id": u["id"],
-            "name": u["name"],
-            "email": u["email"],
-            "user_type": u["user_type"],
-            "unique_id": u["unique_id"],
-            "is_admin": u["is_admin"],
-        }
-    return None
+def export_to_excel(df):
+    output = io.BytesIO()
+    writer = pd.ExcelWriter(output, engine='xlsxwriter')
+    df.to_excel(writer, index=False, sheet_name='Rapor')
+    writer.close()
+    processed_data = output.getvalue()
+    return processed_data
 
-def get_user_by_email(email):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE email=?", (email,))
-    r = c.fetchone()
-    conn.close()
-    return r
-
-def get_teacher_id(email):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT unique_id FROM users WHERE email=? AND user_type='ÖĞRETMEN'", (email,))
-    r = c.fetchone()
-    conn.close()
-    return r["unique_id"] if r else None
-
-def get_student_id(email):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT unique_id FROM users WHERE email=? AND user_type='ÖĞRENCİ'", (email,))
-    r = c.fetchone()
-    conn.close()
-    return r["unique_id"] if r else None
-
-def create_password_reset_token(email):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE email=?", (email,))
-    u = c.fetchone()
-    if not u:
-        conn.close()
-        return None
-    token = generate_reset_token()
-    expires = datetime.now() + timedelta(hours=24)
-    c.execute(
-        "INSERT INTO password_reset_tokens (user_id,token,expires_at) VALUES (?,?,?)",
-        (u["id"], token, expires),
-    )
-    conn.commit()
-    conn.close()
-    return token
-
-def reset_password_with_token(token, new_password):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "SELECT user_id FROM password_reset_tokens WHERE token=? AND expires_at>datetime('now')",
-        (token,),
-    )
-    r = c.fetchone()
-    if not r:
-        conn.close()
-        return False
-    c.execute(
-        "UPDATE users SET password=? WHERE id=?",
-        (hash_password(new_password), r["user_id"]),
-    )
-    c.execute("DELETE FROM password_reset_tokens WHERE token=?", (token,))
-    conn.commit()
-    conn.close()
-    return True
-
-def add_course(student_id, course_name, is_demo=False):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO courses (student_id,course_name,is_demo) VALUES (?,?,?)",
-        (student_id, course_name, int(is_demo)),
-    )
-    conn.commit()
-    cid = c.lastrowid
-    conn.close()
-    return cid
-
-def get_student_courses(student_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "SELECT * FROM courses WHERE student_id=? ORDER BY created_at DESC",
-        (student_id,),
-    )
-    r = c.fetchall()
-    conn.close()
-    return r
-
-def add_unit(course_id, unit_name, is_demo=False):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO units (course_id,unit_name,is_demo) VALUES (?,?,?)",
-        (course_id, unit_name, int(is_demo)),
-    )
-    conn.commit()
-    uid = c.lastrowid
-    conn.close()
-    return uid
-
-def get_course_units(course_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM units WHERE course_id=? ORDER BY created_at", (course_id,))
-    r = c.fetchall()
-    conn.close()
-    return r
-
-def update_unit_completion(unit_id, is_completed):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE units SET is_completed=? WHERE id=?",
-        (int(is_completed), unit_id),
-    )
-    conn.commit()
-    conn.close()
-
-def delete_course(course_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM units WHERE course_id=?", (course_id,))
-    c.execute("DELETE FROM courses WHERE id=?", (course_id,))
-    conn.commit()
-    conn.close()
-
-def delete_unit(unit_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM units WHERE id=?", (unit_id,))
-    conn.commit()
-    conn.close()
-
-def add_daily_entry(student_id, entry_date, course_id, unit_id,
-                    questions_solved, wrong_answers, empty_answers,
-                    duration_minutes, repeated, is_demo=False):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        """INSERT INTO daily_entries
-           (student_id,entry_date,course_id,unit_id,questions_solved,
-            wrong_answers,empty_answers,duration_minutes,repeated,is_demo)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (
-            student_id,
-            entry_date,
-            course_id,
-            unit_id,
-            questions_solved,
-            wrong_answers,
-            empty_answers,
-            duration_minutes,
-            int(repeated),
-            int(is_demo),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-def get_daily_entries(student_id, entry_date=None):
-    conn = get_db()
-    c = conn.cursor()
-    q = """SELECT d.*,c.course_name,u.unit_name
-           FROM daily_entries d
-           JOIN courses c ON d.course_id=c.id
-           LEFT JOIN units u ON d.unit_id=u.id
-           WHERE d.student_id=?"""
-    params = [student_id]
-    if entry_date:
-        q += " AND d.entry_date=?"
-        params.append(entry_date)
-    q += " ORDER BY d.entry_date DESC,d.created_at DESC"
-    c.execute(q, params)
-    r = c.fetchall()
-    conn.close()
-    return r
-
-def delete_daily_entry(entry_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM daily_entries WHERE id=?", (entry_id,))
-    conn.commit()
-    conn.close()
-
-def add_exam_entry(student_id, exam_date, course_id,
-                   questions_solved, wrong_answers,
-                   empty_answers, duration_minutes, is_demo=False):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        """INSERT INTO exam_entries
-           (student_id,exam_date,course_id,questions_solved,
-            wrong_answers,empty_answers,duration_minutes,is_demo)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        (
-            student_id,
-            exam_date,
-            course_id,
-            questions_solved,
-            wrong_answers,
-            empty_answers,
-            duration_minutes,
-            int(is_demo),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-def get_exam_entries(student_id, exam_date=None):
-    conn = get_db()
-    c = conn.cursor()
-    q = """SELECT e.*,c.course_name
-           FROM exam_entries e
-           JOIN courses c ON e.course_id=c.id
-           WHERE e.student_id=?"""
-    params = [student_id]
-    if exam_date:
-        q += " AND e.exam_date=?"
-        params.append(exam_date)
-    q += " ORDER BY e.exam_date DESC,e.created_at DESC"
-    c.execute(q, params)
-    r = c.fetchall()
-    conn.close()
-    return r
-
-def delete_exam_entry(entry_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM exam_entries WHERE id=?", (entry_id,))
-    conn.commit()
-    conn.close()
-
-def link_teacher_student(teacher_id, student_unique_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "SELECT id FROM users WHERE unique_id=? AND user_type='ÖĞRENCİ'",
-        (student_unique_id,),
-    )
-    s = c.fetchone()
-    if not s:
-        conn.close()
-        return False
-    c.execute(
-        "INSERT OR IGNORE INTO teacher_students (teacher_id,student_id) VALUES (?,?)",
-        (teacher_id, s["id"]),
-    )
-    conn.commit()
-    conn.close()
-    return True
-
-def get_teacher_students(teacher_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        """SELECT u.* FROM users u
-           JOIN teacher_students ts ON u.id=ts.student_id
-           WHERE ts.teacher_id=?""",
-        (teacher_id,),
-    )
-    r = c.fetchall()
-    conn.close()
-    return r
-
-def link_parent_student(parent_id, student_unique_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "SELECT id FROM users WHERE unique_id=? AND user_type='ÖĞRENCİ'",
-        (student_unique_id,),
-    )
-    s = c.fetchone()
-    if not s:
-        conn.close()
-        return False
-    c.execute(
-        "INSERT OR IGNORE INTO parent_students (parent_id,student_id) VALUES (?,?)",
-        (parent_id, s["id"]),
-    )
-    conn.commit()
-    conn.close()
-    return True
-
-def get_parent_students(parent_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        """SELECT u.* FROM users u
-           JOIN parent_students ps ON u.id=ps.student_id
-           WHERE ps.parent_id=?""",
-        (parent_id,),
-    )
-    r = c.fetchall()
-    conn.close()
-    return r
-
-def get_all_users(user_type=None):
-    conn = get_db()
-    c = conn.cursor()
-    if user_type:
-        c.execute(
-            "SELECT * FROM users WHERE user_type=? ORDER BY created_at DESC",
-            (user_type,),
-        )
-    else:
-        c.execute("SELECT * FROM users ORDER BY created_at DESC")
-    r = c.fetchall()
-    conn.close()
-    return r
-
-def delete_user(user_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def make_user_admin(user_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_admin=1 WHERE id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def set_user_password(user_id, new_password):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE users SET password=? WHERE id=?",
-        (hash_password(new_password), user_id),
-    )
-    conn.commit()
-    conn.close()
-
-def get_student_count():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) AS c FROM users WHERE user_type='ÖĞRENCİ'")
-    r = c.fetchone()
-    conn.close()
-    return r["c"] if r else 0
-
-def get_teacher_count():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) AS c FROM users WHERE user_type='ÖĞRETMEN'")
-    r = c.fetchone()
-    conn.close()
-    return r["c"] if r else 0
-
-def get_parent_count():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) AS c FROM users WHERE user_type='VELİ'")
-    r = c.fetchone()
-    conn.close()
-    return r["c"] if r else 0
-
-def delete_all_demo_data():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM daily_entries WHERE is_demo=1")
-    c.execute("DELETE FROM exam_entries WHERE is_demo=1")
-    c.execute("DELETE FROM units WHERE is_demo=1")
-    c.execute("DELETE FROM courses WHERE is_demo=1")
-    conn.commit()
-    conn.close()
-
-def calculate_success_rate(q, w):
-    if not q:
-        return 0.0
-    return (q - w) / q * 100.0
-
-def get_student_stats(student_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "SELECT SUM(questions_solved) AS tq, SUM(wrong_answers) AS tw FROM daily_entries WHERE student_id=?",
-        (student_id,),
-    )
-    r1 = c.fetchone() or {"tq": 0, "tw": 0}
-    c.execute(
-        """SELECT COUNT(*) AS total_units,
-                  SUM(CASE WHEN is_completed=1 THEN 1 ELSE 0 END) AS comp
-           FROM units u
-           JOIN courses c2 ON u.course_id=c2.id
-           WHERE c2.student_id=?""",
-        (student_id,),
-    )
-    r2 = c.fetchone() or {"total_units": 0, "comp": 0}
-    conn.close()
-    tq = r1["tq"] or 0
-    tw = r1["tw"] or 0
-    sr = calculate_success_rate(tq, tw)
-    return {
-        "total_questions": tq,
-        "total_wrong": tw,
-        "completed_units": r2["comp"] or 0,
-        "total_units": r2["total_units"] or 0,
-        "success_rate": round(sr, 2),
-    }
-
-def get_daily_summary(student_id, date):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        """SELECT d.course_id,d.unit_id,c.course_name,u.unit_name,
-                  SUM(d.questions_solved) AS daily_q,
-                  SUM(d.wrong_answers) AS daily_w,
-                  SUM(d.empty_answers) AS daily_e,
-                  SUM(d.duration_minutes) AS daily_time
-           FROM daily_entries d
-           JOIN courses c ON d.course_id=c.id
-           LEFT JOIN units u ON d.unit_id=u.id
-           WHERE d.student_id=? AND d.entry_date=?
-           GROUP BY d.course_id,d.unit_id""",
-        (student_id, date),
-    )
-    r = c.fetchall()
-    conn.close()
-    return r
-
-def get_weekly_summary(student_id, start_date, end_date):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        """SELECT d.course_id,c.course_name,
-                  COUNT(DISTINCT d.entry_date) AS study_days,
-                  SUM(d.questions_solved) AS weekly_q,
-                  SUM(d.wrong_answers) AS weekly_w,
-                  SUM(d.empty_answers) AS weekly_e
-           FROM daily_entries d
-           JOIN courses c ON d.course_id=c.id
-           WHERE d.student_id=? AND d.entry_date BETWEEN ? AND ?
-           GROUP BY d.course_id""",
-        (student_id, start_date, end_date),
-    )
-    r = c.fetchall()
-    conn.close()
-    return r
-
-def get_monthly_summary(student_id, year, month):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        """SELECT d.course_id,c.course_name,
-                  COUNT(DISTINCT d.entry_date) AS study_days,
-                  SUM(d.questions_solved) AS monthly_q
-           FROM daily_entries d
-           JOIN courses c ON d.course_id=c.id
-           WHERE d.student_id=? AND strftime('%Y',d.entry_date)=? AND strftime('%m',d.entry_date)=?
-           GROUP BY d.course_id""",
-        (student_id, str(year), str(month).zfill(2)),
-    )
-    r = c.fetchall()
-    conn.close()
-    return r
-
-# ===================== STREAMLIT ARAYÜZÜ =====================
-
-st.set_page_config(
-    page_title="🎓 Öğrenci Takip Sistemi v2.1",
-    page_icon="📚",
-    layout="wide",
-)
-
-st.markdown(
-    """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700;800&display=swap');
-* { font-family: 'Poppins', sans-serif; }
-.motivasyon { background: linear-gradient(135deg,#667eea 0%,#764ba2 100%); padding:20px; border-radius:15px; color:white; text-align:center; margin:10px 0; }
-.info-box { background:linear-gradient(135deg,#4facfe 0%,#00f2fe 100%); padding:15px; border-radius:10px; color:white; margin:10px 0; }
-.success-box { background:linear-gradient(135deg,#11998e 0%,#38ef7d 100%); padding:15px; border-radius:10px; color:white; margin:10px 0; }
-.header-title { font-size:30px; font-weight:800; text-align:center; margin:20px 0;
-    background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-init_db()
-
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.user_type = None
-    st.session_state.user_name = None
-    st.session_state.user_email = None
-    st.session_state.user_id = None
-    st.session_state.is_admin = 0
-
-motivasyon_mesajlari = [
-    "🚀 Her gün biraz daha ileri git!",
-    "💪 Zorluklar seni güçlendirir!",
-    "🌟 Başarı sabır ve çalışkanlığın birleşimidir!",
-    "📈 Küçük adımlar büyük sonuçlar getirir!",
-]
-motivasyon_mesaji = random.choice(motivasyon_mesajlari)
+# --- OTURUM YÖNETİMİ ---
 
 def login_page():
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown(
-            '<div class="header-title">🎓 Öğrenci Takip Sistemi v2.1</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="motivasyon">{motivasyon_mesaji}</div>',
-            unsafe_allow_html=True,
-        )
-
-        tab1, tab2, tab3 = st.tabs(["🔐 Giriş", "📝 Üye Ol", "🔑 Şifremi Unuttum"])
-
-        with tab1:
-            email = st.text_input("📧 E-mail")
-            pw = st.text_input("🔐 Şifre", type="password")
-            if st.button("Giriş Yap", use_container_width=True):
-                u = verify_user(email, pw)
-                if u:
-                    st.session_state.logged_in = True
-                    st.session_state.user_type = u["user_type"]
-                    st.session_state.user_name = u["name"]
-                    st.session_state.user_email = u["email"]
-                    st.session_state.user_id = u["id"]
-                    st.session_state.is_admin = u["is_admin"]
-                    st.success("✅ Giriş başarılı!")
-                    st.rerun()
-                else:
-                    st.error("❌ E-mail veya şifre hatalı!")
-
-        with tab2:
-            name = st.text_input("👤 Ad Soyad", key="reg_name")
-            remail = st.text_input("📧 E-mail", key="reg_email")
-            phone = st.text_input("📱 Telefon", key="reg_phone")
-            utype = st.selectbox("👥 Rol", ["ÖĞRENCİ", "ÖĞRETMEN", "VELİ"])
-            rp1 = st.text_input("🔐 Şifre", type="password", key="reg_p1")
-            rp2 = st.text_input("🔐 Şifre (Tekrar)", type="password", key="reg_p2")
-            if st.button("Üyelik Oluştur", use_container_width=True):
-                if not all([name, remail, phone, rp1, rp2]):
-                    st.error("Tüm alanları doldurun.")
-                elif rp1 != rp2:
-                    st.error("Şifreler aynı olmalı.")
-                else:
-                    uid = add_user(name, remail, phone, rp1, utype, False)
-                    if uid:
-                        st.success("✅ Üyelik tamamlandı, giriş yapabilirsiniz.")
-                    else:
-                        st.error("Bu e-mail zaten kayıtlı.")
-
-        with tab3:
-            rem = st.text_input("📧 Kayıtlı e-mail", key="reset_email")
-            if st.button("Şifre sıfırlama linki üret", use_container_width=True):
-                if not rem:
-                    st.error("E-mail girin.")
-                elif not get_user_by_email(rem):
-                    st.error("Bu e-mail ile kullanıcı yok.")
-                else:
-                    t = create_password_reset_token(rem)
-                    st.success("✅ Teorik olarak link e-maile gönderildi.")
-                    st.info(f"Test için token: {t}")
-
-def student_dashboard():
-    st.sidebar.markdown(
-        f'<div class="motivasyon">Hoşgeldin {st.session_state.user_name}! 👋</div>',
-        unsafe_allow_html=True,
-    )
-    sid = st.session_state.user_id
-    menu = st.sidebar.radio(
-        "📚 Menü",
-        [
-            "🏠 Anasayfa",
-            "📖 Ders / Ünite",
-            "✅ Ünite Takip",
-            "📝 Günlük",
-            "🧪 Deneme Sınavı",
-            "📊 Çalışma Takibi",
-            "🚪 Çıkış",
-        ],
-    )
-    if menu == "🚪 Çıkış":
-        st.session_state.logged_in = False
-        st.rerun()
-
-    elif menu == "🏠 Anasayfa":
-        st.markdown(
-            '<div class="header-title">📚 Öğrenci Paneli</div>',
-            unsafe_allow_html=True,
-        )
-        stats = get_student_stats(sid)
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("📖 Ders Sayısı", len(get_student_courses(sid)))
-        with c2:
-            st.metric(
-                "✅ Tamamlanan Ünite",
-                f"{stats['completed_units']}/{stats['total_units']}",
-            )
-        with c3:
-            st.metric("📊 Başarı %", f"%{stats['success_rate']:.1f}")
-
-    elif menu == "📖 Ders / Ünite":
-        st.markdown("### 📖 Ders ve Ünite Girişi")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            cname = st.text_input("📚 Ders Adı")
-        with col2:
-            if st.button("➕ Ders Ekle"):
-                if cname:
-                    add_course(sid, cname, False)
-                    st.rerun()
-                else:
-                    st.error("Ders adı boş olamaz.")
-        courses = get_student_courses(sid)
-        if not courses:
-            st.info("Henüz ders yok, yukarıdan ekleyin.")
-        for c in courses:
-            st.write(f"**📚 {c['course_name']}**")
-            ucol1, ucol2, ucol3 = st.columns([2, 1, 1])
-            with ucol1:
-                uname = st.text_input("Ünite adı", key=f"u_{c['id']}")
-            with ucol2:
-                if st.button("➕ Ünite", key=f"uadd_{c['id']}"):
-                    if uname:
-                        add_unit(c["id"], uname, False)
-                        st.rerun()
-            with ucol3:
-                if st.button("🗑️ Dersi Sil", key=f"cdel_{c['id']}"):
-                    delete_course(c["id"])
-                    st.rerun()
-            units = get_course_units(c["id"])
-            for u in units:
-                st.write(f"• {u['unit_name']}")
-
-    elif menu == "✅ Ünite Takip":
-        st.markdown("### ✅ Ünite Takip")
-        courses = get_student_courses(sid)
-        if not courses:
-            st.warning("Önce ders eklenmeli.")
-            return
-        cid = st.selectbox(
-            "Ders seç",
-            [c["id"] for c in courses],
-            format_func=lambda x: next(
-                c["course_name"] for c in courses if c["id"] == x
-            ),
-        )
-        units = get_course_units(cid)
-        for u in units:
-            checked = st.checkbox(
-                u["unit_name"], value=bool(u["is_completed"]), key=f"chk_{u['id']}"
-            )
-            if checked != bool(u["is_completed"]):
-                update_unit_completion(u["id"], checked)
+    st.header("Giriş Yap")
+    email = st.text_input("E-Mail Adresi")
+    password = st.text_input("Şifre", type="password")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Giriş Yap"):
+            conn = get_db_connection()
+            c = conn.cursor()
+            hashed_pw = hash_password(password)
+            c.execute("SELECT * FROM users WHERE email=? AND password=?", (email, hashed_pw))
+            user = c.fetchone()
+            conn.close()
+            
+            if user:
+                st.session_state['user_id'] = user[0]
+                st.session_state['name'] = user[1]
+                st.session_state['role'] = user[2]
+                st.session_state['unique_id'] = user[6]
+                st.success(f"Hoşgeldiniz {user[1]} ({user[2]})")
                 st.rerun()
-
-    elif menu == "📝 Günlük":
-        st.markdown("### 📝 Günlük Giriş")
-        courses = get_student_courses(sid)
-        if not courses:
-            st.warning("Ders ekleyin.")
-            return
-        dt = st.date_input("📅 Tarih", datetime.now())
-        cid = st.selectbox(
-            "Ders",
-            [c["id"] for c in courses],
-            format_func=lambda x: next(
-                c["course_name"] for c in courses if c["id"] == x
-            ),
-        )
-        units = get_course_units(cid)
-        ulist = {u["id"]: u["unit_name"] for u in units}
-        sel_units = st.multiselect(
-            "Üniteler", list(ulist.keys()), format_func=lambda x: ulist[x]
-        )
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            q = st.number_input("❓ Soru", min_value=0, step=1)
-        with c2:
-            w = st.number_input("❌ Yanlış", min_value=0, step=1)
-        with c3:
-            e = st.number_input("⬜ Boş", min_value=0, step=1)
-        dur = st.number_input("⏱ Süre (dk)", min_value=0, step=1)
-        rep = st.checkbox("🔄 Tekrar")
-        if st.button("💾 Kaydet"):
-            if not sel_units:
-                add_daily_entry(sid, dt, cid, None, q, w, e, dur, rep, False)
-            for uid in sel_units:
-                add_daily_entry(sid, dt, cid, uid, q, w, e, dur, rep, False)
-            st.success("Günlük kayıt eklendi.")
-            st.rerun()
-        st.markdown("#### Bugünün Kayıtları")
-        entries = get_daily_entries(sid, dt)
-        for en in entries:
-            col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
-            with col1:
-                st.write(
-                    f"{en['course_name']} - {en['unit_name'] or 'Ünite yok'}"
-                )
-            with col2:
-                st.write(f"❓ {en['questions_solved']} / ❌ {en['wrong_answers']}")
-            with col3:
-                st.write(f"⬜ {en['empty_answers']} | ⏱ {en['duration_minutes']} dk")
-            with col4:
-                if st.button("🗑️", key=f"del_d_{en['id']}"):
-                    delete_daily_entry(en["id"])
-                    st.rerun()
-
-    elif menu == "🧪 Deneme Sınavı":
-        st.markdown("### 🧪 Deneme Sınavı")
-        courses = get_student_courses(sid)
-        if not courses:
-            st.warning("Ders ekleyin.")
-            return
-        dt = st.date_input("📅 Tarih", datetime.now(), key="exam_dt")
-        cid = st.selectbox(
-            "Ders",
-            [c["id"] for c in courses],
-            format_func=lambda x: next(
-                c["course_name"] for c in courses if c["id"] == x
-            ),
-        )
-        c1, c2 = st.columns(2)
-        with c1:
-            q = st.number_input("❓ Soru", min_value=0, step=1, key="eq")
-        with c2:
-            w = st.number_input("❌ Yanlış", min_value=0, step=1, key="ew")
-        if q > 0:
-            sr = calculate_success_rate(q, w)
-            st.write(f"📊 Başarı: %{sr:.1f}")
-        if st.button("💾 Sınavı Kaydet"):
-            add_exam_entry(sid, dt, cid, q, w, 0, 0, False)
-            st.success("Deneme kaydedildi.")
-            st.rerun()
-        st.markdown("#### Bugünkü Denemeler")
-        exs = get_exam_entries(sid, dt)
-        for ex in exs:
-            col1, col2, col3 = st.columns([3, 3, 1])
-            with col1:
-                st.write(ex["course_name"])
-            with col2:
-                sr2 = calculate_success_rate(
-                    ex["questions_solved"], ex["wrong_answers"]
-                )
-                st.write(
-                    f"❓ {ex['questions_solved']} | ❌ {ex['wrong_answers']} | %{sr2:.1f}"
-                )
-            with col3:
-                if st.button("🗑️", key=f"del_e_{ex['id']}"):
-                    delete_exam_entry(ex["id"])
-                    st.rerun()
-
-    elif menu == "📊 Çalışma Takibi":
-        st.markdown("### 📊 Çalışma Takibi")
-        courses = get_student_courses(sid)
-        if not courses:
-            st.warning("Ders ekleyin.")
-            return
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["📅 Günlük", "📆 Haftalık", "🗓 Aylık", "📊 Tüm Zamanlar"]
-        )
-        with tab1:
-            d = st.date_input("Tarih", datetime.now(), key="trk_d")
-            rows = get_daily_summary(sid, d)
-            if rows:
-                df = pd.DataFrame(
-                    [
-                        {
-                            "Ders": r["course_name"],
-                            "Ünite": r["unit_name"] or "",
-                            "Soru": r["daily_q"],
-                            "Yanlış": r["daily_w"],
-                            "Boş": r["daily_e"],
-                        }
-                        for r in rows
-                    ]
-                )
-                st.dataframe(df, use_container_width=True)
             else:
-                st.info("Bu tarihte veri yok.")
-        with tab2:
-            end = st.date_input("Hafta sonu", datetime.now(), key="trk_w")
-            start = end - timedelta(days=7)
-            rows = get_weekly_summary(sid, start, end)
-            if rows:
-                df = pd.DataFrame(
-                    [
-                        {
-                            "Ders": r["course_name"],
-                            "Çalışma Günü": r["study_days"],
-                            "Soru": r["weekly_q"],
-                        }
-                        for r in rows
-                    ]
-                )
-                st.dataframe(df, use_container_width=True)
-        with tab3:
-            year = st.number_input(
-                "Yıl", min_value=2020, max_value=2100, value=datetime.now().year
-            )
-            month = st.number_input(
-                "Ay", min_value=1, max_value=12, value=datetime.now().month
-            )
-            rows = get_monthly_summary(sid, year, month)
-            if rows:
-                df = pd.DataFrame(
-                    [
-                        {
-                            "Ders": r["course_name"],
-                            "Çalışma Günü": r["study_days"],
-                            "Soru": r["monthly_q"],
-                        }
-                        for r in rows
-                    ]
-                )
-                st.dataframe(df, use_container_width=True)
-        with tab4:
-            stats = get_student_stats(sid)
-            st.metric("Toplam Soru", stats["total_questions"])
-            st.metric("Genel Başarı %", f"%{stats['success_rate']:.1f}")
+                st.error("Hatalı E-Mail veya Şifre")
+    
+    with col2:
+        if st.button("Şifremi Unuttum"):
+            st.session_state['page'] = 'forgot_password'
+            st.rerun()
 
-def teacher_dashboard():
-    st.sidebar.markdown(
-        f'<div class="motivasyon">Hoşgeldin Öğretmen {st.session_state.user_name}! 👋</div>',
-        unsafe_allow_html=True,
-    )
-    tid = st.session_state.user_id
-    menu = st.sidebar.radio(
-        "📚 Menü",
-        [
-            "🏠 Anasayfa",
-            "👨‍🎓 Öğrencilerim",
-            "📊 Çalışma Takibi",
-            "🚪 Çıkış",
-        ],
-    )
-    if menu == "🚪 Çıkış":
-        st.session_state.logged_in = False
+    st.markdown("---")
+    st.subheader("Hesabınız yok mu?")
+    if st.button("Yeni Üyelik Oluştur"):
+        st.session_state['page'] = 'register'
         st.rerun()
-    elif menu == "🏠 Anasayfa":
-        st.markdown(
-            '<div class="header-title">👨‍🏫 Öğretmen Paneli</div>',
-            unsafe_allow_html=True,
-        )
-        students = get_teacher_students(tid)
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("👨‍🎓 Öğrenci", len(students))
-        with c2:
-            if students:
-                avg = sum(
-                    get_student_stats(s["id"])["success_rate"] for s in students
-                ) / len(students)
-                st.metric("📊 Sınıf Ort.", f"%{avg:.1f}")
-        with c3:
-            st.metric(
-                "📚 Toplam Ders",
-                sum(len(get_student_courses(s["id"])) for s in students),
-            )
-        if st.checkbox("Öğrenci Ekle"):
-            sid_code = st.text_input("Öğrenci ID (6 hane)")
-            if st.button("Ekle"):
-                if link_teacher_student(tid, sid_code):
-                    st.success("Öğrenci eklendi.")
-                    st.rerun()
-                else:
-                    st.error("Öğrenci bulunamadı.")
-    elif menu == "👨‍🎓 Öğrencilerim":
-        students = get_teacher_students(tid)
-        if not students:
-            st.info("Henüz öğrenci yok.")
-            return
-        df = pd.DataFrame(
-            [
-                {
-                    "Adı": s["name"],
-                    "E-mail": s["email"],
-                    "Ders": len(get_student_courses(s["id"])),
-                }
-                for s in students
-            ]
-        )
-        st.dataframe(df, use_container_width=True)
-    elif menu == "📊 Çalışma Takibi":
-        students = get_teacher_students(tid)
-        if not students:
-            st.info("Öğrenci ekleyin.")
-            return
-        sid = st.selectbox(
-            "Öğrenci",
-            [s["id"] for s in students],
-            format_func=lambda x: next(
-                s["name"] for s in students if s["id"] == x
-            ),
-        )
-        stats = get_student_stats(sid)
-        st.metric("Toplam Soru", stats["total_questions"])
-        st.metric("Başarı %", f"%{stats['success_rate']:.1f}")
 
-def parent_dashboard():
-    st.sidebar.markdown(
-        f'<div class="motivasyon">Hoşgeldin Veli {st.session_state.user_name}! 👋</div>',
-        unsafe_allow_html=True,
-    )
-    pid = st.session_state.user_id
-    menu = st.sidebar.radio(
-        "📚 Menü",
-        ["🏠 Anasayfa", "👨‍🎓 Çocuğum", "📊 Takip", "🚪 Çıkış"],
-    )
-    if menu == "🚪 Çıkış":
-        st.session_state.logged_in = False
+def register_page():
+    st.header("Üyelik Oluştur")
+    name = st.text_input("Adı Soyadı")
+    role = st.selectbox("Üyelik Statüsü", ["Öğrenci", "Öğretmen", "Veli"])
+    email = st.text_input("E-Mail Adresi")
+    phone = st.text_input("Telefon Numarası")
+    p1 = st.text_input("Şifre", type="password")
+    p2 = st.text_input("Şifre Doğrulama", type="password")
+    
+    if st.button("Üyelik Oluştur"):
+        if p1 != p2:
+            st.error("Şifreler uyuşmuyor!")
+            return
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        # Email kontrolü
+        c.execute("SELECT * FROM users WHERE email=?", (email,))
+        if c.fetchone():
+            st.error("Bu E-Mail adresi zaten kullanılıyor.")
+            conn.close()
+            return
+        
+        unique_id = generate_unique_id()
+        # Unique ID çakışma kontrolü (basit döngü)
+        while True:
+            c.execute("SELECT * FROM users WHERE unique_id=?", (unique_id,))
+            if not c.fetchone():
+                break
+            unique_id = generate_unique_id()
+            
+        hashed_pw = hash_password(p1)
+        c.execute("INSERT INTO users (name, role, email, phone, password, unique_id) VALUES (?, ?, ?, ?, ?, ?)",
+                  (name, role, email, phone, hashed_pw, unique_id))
+        conn.commit()
+        conn.close()
+        st.success("Üyelik başarıyla oluşturuldu! Giriş ekranına yönlendiriliyorsunuz.")
+        st.session_state['page'] = 'login'
         st.rerun()
-    elif menu == "🏠 Anasayfa":
-        st.markdown(
-            '<div class="header-title">👨‍👩‍👧 Veli Paneli</div>',
-            unsafe_allow_html=True,
-        )
-        students = get_parent_students(pid)
-        if not students:
-            st.warning("Çocuk ekleyin.")
-            if st.checkbox("Çocuk Ekle"):
-                sid_code = st.text_input("Öğrenci ID (6 hane)")
-                if st.button("Ekle"):
-                    if link_parent_student(pid, sid_code):
-                        st.success("Eklendi.")
-                        st.rerun()
-                    else:
-                        st.error("Bulunamadı.")
+        
+    if st.button("Giriş Ekranına Dön"):
+        st.session_state['page'] = 'login'
+        st.rerun()
+
+def forgot_password_page():
+    st.header("Şifremi Unuttum")
+    email = st.text_input("Kayıtlı E-Mail Adresinizi Girin")
+    new_p1 = st.text_input("Yeni Şifre", type="password")
+    new_p2 = st.text_input("Yeni Şifre Doğrulama", type="password")
+    
+    if st.button("Şifremi Güncelle"):
+        if new_p1 != new_p2:
+            st.error("Şifreler uyuşmuyor.")
+            return
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE email=?", (email,))
+        user = c.fetchone()
+        
+        if user:
+            hashed_pw = hash_password(new_p1)
+            c.execute("UPDATE users SET password=? WHERE email=?", (hashed_pw, email))
+            conn.commit()
+            st.success("Şifreniz güncellendi. Giriş yapabilirsiniz.")
+            # Normalde burada e-mail simülasyonu yapılır.
         else:
-            s = students[0]
-            stats = get_student_stats(s["id"])
-            st.metric("Çocuğum", s["name"])
-            st.metric("Başarı %", f"%{stats['success_rate']:.1f}")
-    elif menu == "👨‍🎓 Çocuğum":
-        students = get_parent_students(pid)
-        if not students:
-            st.info("Çocuk yok.")
-            return
-        s = students[0]
-        st.write(f"Adı: {s['name']}")
-        st.write(f"E-mail: {s['email']}")
-        st.write(f"ID: {s['unique_id']}")
-    elif menu == "📊 Takip":
-        students = get_parent_students(pid)
-        if not students:
-            st.info("Çocuk yok.")
-            return
-        s = students[0]
-        stats = get_student_stats(s["id"])
-        st.metric("Toplam Soru", stats["total_questions"])
-        st.metric("Başarı %", f"%{stats['success_rate']:.1f}")
-
-def admin_dashboard():
-    st.sidebar.markdown(
-        '<div class="motivasyon">Admin Paneli 🔐</div>', unsafe_allow_html=True
-    )
-    menu = st.sidebar.radio(
-        "⚙️ Admin Menü",
-        [
-            "🏠 Anasayfa",
-            "👨‍🎓 Öğrenciler",
-            "👨‍🏫 Öğretmenler",
-            "👨‍👩‍👧 Veliler",
-            "🗑 Demo Veriler",
-            "🚪 Çıkış",
-        ],
-    )
-    if menu == "🚪 Çıkış":
-        st.session_state.logged_in = False
+            st.error("Bu e-mail adresi sistemde kayıtlı değil.")
+        conn.close()
+        
+    if st.button("Geri Dön"):
+        st.session_state['page'] = 'login'
         st.rerun()
-    elif menu == "🏠 Anasayfa":
-        st.markdown(
-            '<div class="header-title">🔐 Admin Paneli</div>',
-            unsafe_allow_html=True,
-        )
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("Öğrenci", get_student_count())
-        with c2:
-            st.metric("Öğretmen", get_teacher_count())
-        with c3:
-            st.metric("Veli", get_parent_count())
-        with c4:
-            st.metric(
-                "Toplam",
-                get_student_count() + get_teacher_count() + get_parent_count(),
-            )
-    elif menu == "👨‍🎓 Öğrenciler":
-        students = get_all_users("ÖĞRENCİ")
-        if not students:
-            st.info("Öğrenci yok.")
-            return
-        df = pd.DataFrame(
-            [{"Adı": s["name"], "E-mail": s["email"]} for s in students]
-        )
-        st.dataframe(df, use_container_width=True)
-    elif menu == "👨‍🏫 Öğretmenler":
-        teachers = get_all_users("ÖĞRETMEN")
-        if not teachers:
-            st.info("Öğretmen yok.")
-            return
-        df = pd.DataFrame(
-            [{"Adı": t["name"], "E-mail": t["email"]} for t in teachers]
-        )
-        st.dataframe(df, use_container_width=True)
-    elif menu == "👨‍👩‍👧 Veliler":
-        parents = get_all_users("VELİ")
-        if not parents:
-            st.info("Veli yok.")
-            return
-        df = pd.DataFrame(
-            [{"Adı": p["name"], "E-mail": p["email"]} for p in parents]
-        )
-        st.dataframe(df, use_container_width=True)
-    elif menu == "🗑 Demo Veriler":
-        st.warning("Tüm demo verileri silinecek.")
-        if st.button("Demo verileri sil"):
-            delete_all_demo_data()
-            st.success("Demo verileri silindi.")
+
+# --- ANALİZ VE RAPOR FONKSİYONLARI ---
+
+def get_student_analysis(student_id):
+    conn = get_db_connection()
+    
+    # Çalışma Verileri
+    df_study = pd.read_sql(f"""
+        SELECT s.subject_name, u.unit_name, l.date, l.q_solved, l.q_wrong, l.q_empty, l.duration, l.is_repeated
+        FROM study_logs l
+        JOIN units u ON l.unit_id = u.id
+        JOIN subjects s ON l.subject_id = s.id
+        WHERE l.student_id = {student_id}
+    """, conn)
+    
+    # Deneme Verileri
+    df_exam = pd.read_sql(f"""
+        SELECT s.subject_name, e.date, e.q_solved, e.q_wrong, e.q_empty, e.duration
+        FROM exam_logs e
+        JOIN subjects s ON e.subject_id = s.id
+        WHERE e.student_id = {student_id}
+    """, conn)
+    
+    conn.close()
+    return df_study, df_exam
+
+def display_analysis_dashboard(df_study, df_exam):
+    st.write("### 📊 Genel Analiz Paneli")
+    
+    tab1, tab2 = st.tabs(["Ders/Ünite Analizi", "Deneme Sınavı Analizi"])
+    
+    with tab1:
+        if df_study.empty:
+            st.info("Henüz çalışma verisi girilmemiş.")
+        else:
+            # Temel Metrikler
+            total_q = df_study['q_solved'].sum()
+            total_wrong = df_study['q_wrong'].sum()
+            total_empty = df_study['q_empty'].sum()
+            if total_q > 0:
+                success_rate = ((total_q - total_wrong - total_empty) / total_q) * 100
+                gap_to_100 = 100 - success_rate
+            else:
+                success_rate = 0
+                gap_to_100 = 100
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Toplam Soru", total_q)
+            col2.metric("Toplam Yanlış", total_wrong)
+            col3.metric("Başarı Oranı", f"%{success_rate:.2f}")
+            col4.metric("%100 Hedefine Kalan", f"%{gap_to_100:.2f}")
+            
+            # Grafikler
+            st.subheader("Derslere Göre Soru Dağılımı")
+            fig_pie = px.pie(df_study, values='q_solved', names='subject_name', title='Ders Bazlı Çözülen Soru')
+            st.plotly_chart(fig_pie, use_container_width=True)
+            
+            st.subheader("Ünite Bazlı Başarı Analizi")
+            # Ünite bazlı gruplama
+            unit_grp = df_study.groupby(['subject_name', 'unit_name']).sum().reset_index()
+            unit_grp['success_rate'] = ((unit_grp['q_solved'] - unit_grp['q_wrong'] - unit_grp['q_empty']) / unit_grp['q_solved'] * 100).fillna(0)
+            
+            fig_bar = px.bar(unit_grp, x='unit_name', y='success_rate', color='subject_name', title='Ünite Başarı Oranları (%)')
+            st.plotly_chart(fig_bar, use_container_width=True)
+            
+            # Tarihsel Gelişim (Trend)
+            st.subheader("Zaman İçinde Başarı Değişimi")
+            df_study['date'] = pd.to_datetime(df_study['date'])
+            daily_grp = df_study.groupby('date').sum().reset_index()
+            daily_grp['daily_success'] = ((daily_grp['q_solved'] - daily_grp['q_wrong']) / daily_grp['q_solved'] * 100).fillna(0)
+            fig_line = px.line(daily_grp, x='date', y='daily_success', title='Günlük Başarı Grafiği')
+            st.plotly_chart(fig_line, use_container_width=True)
+            
+            # Excel İndir
+            excel_file = export_to_excel(df_study)
+            st.download_button(label="📥 Ünite Çalışma Raporunu İndir (Excel)", 
+                               data=excel_file, file_name='unite_calisma_raporu.xlsx')
+
+    with tab2:
+        if df_exam.empty:
+            st.info("Henüz deneme sınavı verisi girilmemiş.")
+        else:
+            st.subheader("Deneme Sınavı İstatistikleri")
+            exam_grp = df_exam.groupby('subject_name').sum().reset_index()
+            exam_grp['net'] = exam_grp['q_solved'] - exam_grp['q_wrong'] - (exam_grp['q_wrong'] / 4) # Klasik net hesabı (opsiyonel)
+            
+            st.dataframe(exam_grp)
+            
+            fig_exam = px.bar(exam_grp, x='subject_name', y=['q_solved', 'q_wrong', 'q_empty'], 
+                              title="Ders Bazlı Deneme Analizi", barmode='group')
+            st.plotly_chart(fig_exam, use_container_width=True)
+
+            excel_exam = export_to_excel(df_exam)
+            st.download_button(label="📥 Deneme Sınavı Raporunu İndir (Excel)", 
+                               data=excel_exam, file_name='deneme_sinavi_raporu.xlsx')
+
+# --- KULLANICI ARAYÜZLERİ ---
+
+def student_interface():
+    st.sidebar.title(f"Öğrenci: {st.session_state['name']}")
+    st.sidebar.info(f"ÖĞRENCİ ID: **{st.session_state['unique_id']}**")
+    
+    menu = st.sidebar.radio("Menü", ["Öğrenci Bilgisi", "Ders ve Ünite Girişi", "Ünite Takip", "Günlük Giriş", "Deneme Sınavı", "Çalışma Takibi", "Çalışma Analizi"])
+    conn = get_db_connection()
+    c = conn.cursor()
+    student_id = st.session_state['user_id']
+    
+    if menu == "Öğrenci Bilgisi":
+        st.title("Öğrenci Bilgileri")
+        # Öğretmen Ekleme
+        st.subheader("Öğretmenini Ekle")
+        teacher_code = st.text_input("Öğretmen ID'si (6 Haneli)")
+        if st.button("Öğretmeni Kaydet"):
+            c.execute("SELECT id FROM users WHERE unique_id=? AND role='Öğretmen'", (teacher_code,))
+            res = c.fetchone()
+            if res:
+                # Daha önce ekli mi?
+                c.execute("SELECT * FROM relationships WHERE student_id=? AND supervisor_id=?", (student_id, res[0]))
+                if not c.fetchone():
+                    c.execute("INSERT INTO relationships (supervisor_id, student_id, type) VALUES (?, ?, 'ogretmen')", (res[0], student_id))
+                    conn.commit()
+                    st.success("Öğretmen başarıyla eklendi.")
+                else:
+                    st.warning("Bu öğretmen zaten ekli.")
+            else:
+                st.error("Geçersiz Öğretmen ID")
+        
+        # Bilgileri Sil
+        st.markdown("---")
+        if st.button("TÜM BİLGİLERİMİ SİL (DEMO TEMİZLE)", type="primary"):
+            c.execute("DELETE FROM study_logs WHERE student_id=?", (student_id,))
+            c.execute("DELETE FROM exam_logs WHERE student_id=?", (student_id,))
+            c.execute("DELETE FROM units WHERE subject_id IN (SELECT id FROM subjects WHERE student_id=?)", (student_id,))
+            c.execute("DELETE FROM subjects WHERE student_id=?", (student_id,))
+            conn.commit()
+            st.warning("Tüm verileriniz silindi! Geri getirilemez.")
+
+    elif menu == "Ders ve Ünite Girişi":
+        st.title("Ders ve Ünite Yönetimi")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Ders Ekle")
+            new_subject = st.text_input("Ders Adı Giriniz")
+            if st.button("Dersi Ekle"):
+                if new_subject:
+                    c.execute("INSERT INTO subjects (student_id, subject_name) VALUES (?, ?)", (student_id, new_subject))
+                    conn.commit()
+                    st.success(f"{new_subject} eklendi.")
+                    st.rerun()
+
+        with col2:
+            st.subheader("Ünite Ekle")
+            # Mevcut dersleri çek
+            df_subs = pd.read_sql(f"SELECT * FROM subjects WHERE student_id={student_id}", conn)
+            if not df_subs.empty:
+                selected_sub_id = st.selectbox("Ders Seç", df_subs['id'].tolist(), format_func=lambda x: df_subs[df_subs['id']==x]['subject_name'].values[0])
+                new_unit = st.text_input("Ünite Adı Giriniz")
+                if st.button("Üniteyi Ekle"):
+                    if new_unit:
+                        c.execute("INSERT INTO units (subject_id, unit_name) VALUES (?, ?)", (selected_sub_id, new_unit))
+                        conn.commit()
+                        st.success(f"{new_unit} eklendi.")
+            else:
+                st.warning("Önce ders eklemelisiniz.")
+
+        # Listeleme ve Silme
+        st.markdown("---")
+        st.subheader("Mevcut Dersler ve Üniteler")
+        df_all = pd.read_sql(f"""
+            SELECT s.subject_name, u.unit_name, u.id as unit_id, s.id as subject_id 
+            FROM subjects s LEFT JOIN units u ON s.id = u.subject_id 
+            WHERE s.student_id={student_id}
+        """, conn)
+        st.dataframe(df_all)
+        
+        del_unit_id = st.number_input("Silinecek Ünite ID", min_value=0)
+        if st.button("Üniteyi Sil"):
+            c.execute("DELETE FROM units WHERE id=?", (del_unit_id,))
+            conn.commit()
+            st.rerun()
+            
+    elif menu == "Ünite Takip":
+        st.title("Ünite Tamamlama Durumu")
+        df_subs = pd.read_sql(f"SELECT * FROM subjects WHERE student_id={student_id}", conn)
+        
+        if not df_subs.empty:
+            sel_sub = st.selectbox("Ders Seçiniz", df_subs['id'].tolist(), format_func=lambda x: df_subs[df_subs['id']==x]['subject_name'].values[0])
+            
+            # Üniteleri getir
+            units = pd.read_sql(f"SELECT * FROM units WHERE subject_id={sel_sub}", conn)
+            
+            for index, row in units.iterrows():
+                is_done = st.checkbox(f"{row['unit_name']}", value=bool(row['is_completed']), key=f"u_{row['id']}")
+                if is_done != bool(row['is_completed']):
+                    c.execute("UPDATE units SET is_completed=? WHERE id=?", (1 if is_done else 0, row['id']))
+                    conn.commit()
+            
+            # Alt kısımda özet
+            st.markdown("---")
+            st.write("Ders Durumu:")
+            st.dataframe(pd.read_sql(f"SELECT unit_name, CASE WHEN is_completed=1 THEN 'Bitti' ELSE 'Devam Ediyor' END as Durum FROM units WHERE subject_id={sel_sub}", conn))
+
+    elif menu == "Günlük Giriş":
+        st.title("Günlük Çalışma Girişi")
+        date = st.date_input("Tarih", datetime.now())
+        
+        df_subs = pd.read_sql(f"SELECT * FROM subjects WHERE student_id={student_id}", conn)
+        if not df_subs.empty:
+            sel_sub = st.selectbox("Ders Seç", df_subs['id'].tolist(), format_func=lambda x: df_subs[df_subs['id']==x]['subject_name'].values[0])
+            
+            # Üniteler (Multi select)
+            units = pd.read_sql(f"SELECT * FROM units WHERE subject_id={sel_sub}", conn)
+            selected_unit_ids = st.multiselect("Ünite Seçimi (Birden fazla seçilebilir)", units['id'].tolist(), format_func=lambda x: units[units['id']==x]['unit_name'].values[0])
+            
+            col1, col2, col3, col4 = st.columns(4)
+            q_solved = col1.number_input("Çözülen Soru", min_value=0)
+            q_wrong = col2.number_input("Yanlış Sayısı", min_value=0)
+            q_empty = col3.number_input("Boş Sayısı", min_value=0)
+            duration = col4.number_input("Süre (dk)", min_value=0)
+            is_repeated = st.checkbox("Tekrar Yapıldı mı?")
+            
+            if st.button("Kaydet"):
+                for uid in selected_unit_ids:
+                    c.execute("""INSERT INTO study_logs (student_id, subject_id, unit_id, date, q_solved, q_wrong, q_empty, duration, is_repeated) 
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                              (student_id, sel_sub, uid, date, q_solved, q_wrong, q_empty, duration, 1 if is_repeated else 0))
+                conn.commit()
+                st.success("Kayıt Başarılı!")
+            
+            st.subheader("Bugünün Kayıtları")
+            today_logs = pd.read_sql(f"""
+                SELECT s.subject_name, u.unit_name, l.q_solved, l.q_wrong, l.duration 
+                FROM study_logs l JOIN subjects s ON l.subject_id=s.id JOIN units u ON l.unit_id=u.id 
+                WHERE l.student_id={student_id} AND l.date='{date}'""", conn)
+            st.dataframe(today_logs)
+
+    elif menu == "Deneme Sınavı":
+        st.title("Deneme Sınavı Girişi")
+        date = st.date_input("Tarih", datetime.now())
+        
+        df_subs = pd.read_sql(f"SELECT * FROM subjects WHERE student_id={student_id}", conn)
+        selected_subs = st.multiselect("Dersleri Seçiniz", df_subs['id'].tolist(), format_func=lambda x: df_subs[df_subs['id']==x]['subject_name'].values[0])
+        
+        for sub_id in selected_subs:
+            st.markdown(f"**{df_subs[df_subs['id']==sub_id]['subject_name'].values[0]}**")
+            c1, c2, c3, c4 = st.columns(4)
+            qs = c1.number_input(f"Soru Sayısı ({sub_id})", min_value=0, key=f"ds_{sub_id}")
+            qw = c2.number_input(f"Yanlış ({sub_id})", min_value=0, key=f"dw_{sub_id}")
+            qe = c3.number_input(f"Boş ({sub_id})", min_value=0, key=f"de_{sub_id}")
+            dur = c4.number_input(f"Süre ({sub_id})", min_value=0, key=f"dt_{sub_id}")
+            
+            if st.button(f"Kaydet ({sub_id})", key=f"btn_{sub_id}"):
+                c.execute("""INSERT INTO exam_logs (student_id, subject_id, date, q_solved, q_wrong, q_empty, duration)
+                             VALUES (?, ?, ?, ?, ?, ?, ?)""", (student_id, sub_id, date, qs, qw, qe, dur))
+                conn.commit()
+                st.success("Ders notu kaydedildi.")
+
+    elif menu in ["Çalışma Takibi", "Çalışma Analizi"]:
+        df_study, df_exam = get_student_analysis(student_id)
+        display_analysis_dashboard(df_study, df_exam)
+
+    conn.close()
+
+def teacher_interface():
+    st.sidebar.title(f"Öğretmen: {st.session_state['name']}")
+    st.sidebar.info(f"ÖĞRETMEN ID: **{st.session_state['unique_id']}**")
+    
+    menu = st.sidebar.radio("Menü", ["Öğrencilerim", "Öğrenci Çalışma Takibi", "Öğrenci Çalışma Analizi"])
+    conn = get_db_connection()
+    teacher_id = st.session_state['user_id']
+    
+    # Bu öğretmene kayıtlı öğrencileri bul
+    students = pd.read_sql(f"""
+        SELECT u.id, u.name, u.unique_id 
+        FROM users u 
+        JOIN relationships r ON u.id = r.student_id 
+        WHERE r.supervisor_id = {teacher_id} AND r.type='ogretmen'
+    """, conn)
+    
+    if menu == "Öğrencilerim":
+        st.title("Öğrenci Listesi")
+        if students.empty:
+            st.warning("Henüz ID'nizi girerek size kayıt olan öğrenci yok.")
+        else:
+            st.dataframe(students)
+
+    elif menu in ["Öğrenci Çalışma Takibi", "Öğrenci Çalışma Analizi"]:
+        st.title("Öğrenci Analizleri")
+        if not students.empty:
+            selected_student_id = st.selectbox("Öğrenci Seçiniz", students['id'].tolist(), format_func=lambda x: students[students['id']==x]['name'].values[0])
+            
+            df_study, df_exam = get_student_analysis(selected_student_id)
+            display_analysis_dashboard(df_study, df_exam)
+        else:
+            st.warning("Öğrenci bulunamadı.")
+            
+    conn.close()
+
+def parent_interface():
+    st.sidebar.title(f"Veli: {st.session_state['name']}")
+    
+    menu = st.sidebar.radio("Menü", ["Öğrencilerim", "Öğrenci Çalışma Takibi", "Öğrenci Çalışma Analizi"])
+    conn = get_db_connection()
+    c = conn.cursor()
+    parent_id = st.session_state['user_id']
+    
+    if menu == "Öğrencilerim":
+        st.title("Öğrenci Ekleme ve Listeleme")
+        std_code = st.text_input("Öğrenci ID (6 Haneli)")
+        if st.button("Öğrenciyi Getir ve Kaydet"):
+            c.execute("SELECT id, name FROM users WHERE unique_id=? AND role='Öğrenci'", (std_code,))
+            res = c.fetchone()
+            if res:
+                # İlişki kontrolü
+                c.execute("SELECT * FROM relationships WHERE student_id=? AND supervisor_id=?", (res[0], parent_id))
+                if not c.fetchone():
+                    c.execute("INSERT INTO relationships (supervisor_id, student_id, type) VALUES (?, ?, 'veli')", (parent_id, res[0]))
+                    conn.commit()
+                    st.success(f"{res[1]} isimli öğrenci eklendi.")
+                else:
+                    st.warning("Bu öğrenci zaten ekli.")
+            else:
+                st.error("Öğrenci bulunamadı.")
+        
+        st.subheader("Kayıtlı Öğrenciler")
+        students = pd.read_sql(f"""
+            SELECT u.id, u.name, u.unique_id 
+            FROM users u 
+            JOIN relationships r ON u.id = r.student_id 
+            WHERE r.supervisor_id = {parent_id} AND r.type='veli'
+        """, conn)
+        st.dataframe(students)
+
+    elif menu in ["Öğrenci Çalışma Takibi", "Öğrenci Çalışma Analizi"]:
+        students = pd.read_sql(f"""
+            SELECT u.id, u.name 
+            FROM users u 
+            JOIN relationships r ON u.id = r.student_id 
+            WHERE r.supervisor_id = {parent_id} AND r.type='veli'
+        """, conn)
+        
+        if not students.empty:
+            selected_student_id = st.selectbox("Öğrenci Seçiniz", students['id'].tolist(), format_func=lambda x: students[students['id']==x]['name'].values[0])
+            df_study, df_exam = get_student_analysis(selected_student_id)
+            display_analysis_dashboard(df_study, df_exam)
+        else:
+            st.warning("Önce öğrenci eklemelisiniz.")
+            
+    conn.close()
+
+def admin_interface():
+    st.sidebar.title("YÖNETİCİ PANELİ")
+    menu = st.sidebar.radio("Menü", ["Yönetici Girişi", "Öğretmenler", "Veliler", "Tüm Öğrenciler", "Sistem Ayarları"])
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    if menu == "Yönetici Girişi":
+        st.title("Yönetici Profil")
+        st.info(f"Admin: {st.session_state['name']} - {st.session_state['unique_id']}")
+        
+        if st.button("Demo Verileri Sil (Veritabanını Sıfırla)"):
+             # Tabloları drop edip yeniden oluşturmak daha temizdir ama sadece içeriği silelim
+             c.execute("DELETE FROM study_logs")
+             c.execute("DELETE FROM exam_logs")
+             c.execute("DELETE FROM units")
+             c.execute("DELETE FROM subjects")
+             c.execute("DELETE FROM relationships")
+             conn.commit()
+             st.success("Sistem temizlendi.")
+
+    elif menu == "Öğretmenler":
+        st.title("Öğretmen Listesi")
+        teachers = pd.read_sql("SELECT id, name, email, unique_id FROM users WHERE role='Öğretmen'", conn)
+        st.dataframe(teachers)
+        
+        if st.button("Listeyi Excel İndir"):
+             st.download_button("İndir", export_to_excel(teachers), "ogretmenler.xlsx")
+
+    elif menu == "Veliler":
+        st.title("Veli Listesi")
+        parents = pd.read_sql("SELECT id, name, email FROM users WHERE role='Veli'", conn)
+        st.dataframe(parents)
+
+    elif menu == "Tüm Öğrenciler":
+        st.title("Öğrenci Analiz (Admin Modu)")
+        all_students = pd.read_sql("SELECT id, name, unique_id FROM users WHERE role='Öğrenci'", conn)
+        
+        if not all_students.empty:
+            sel_std = st.selectbox("Analiz Edilecek Öğrenci", all_students['id'].tolist(), format_func=lambda x: all_students[all_students['id']==x]['name'].values[0])
+            df_study, df_exam = get_student_analysis(sel_std)
+            display_analysis_dashboard(df_study, df_exam)
+    
+    elif menu == "Sistem Ayarları":
+        st.subheader("Yönetici Yetkisi Ver")
+        users = pd.read_sql("SELECT id, name, email, role FROM users", conn)
+        sel_user = st.selectbox("Kullanıcı Seç", users['id'].tolist(), format_func=lambda x: f"{users[users['id']==x]['name'].values[0]} ({users[users['id']==x]['role'].values[0]})")
+        
+        if st.button("Bu Kişiyi Yönetici Yap"):
+            c.execute("UPDATE users SET role='Yönetici' WHERE id=?", (sel_user,))
+            conn.commit()
+            st.success("Yetki verildi.")
+            
+    conn.close()
+
+# --- ANA UYGULAMA DÖNGÜSÜ ---
 
 def main():
-    with st.sidebar.expander("🔐 Admin Girişi"):
-        un = st.text_input("Kullanıcı", key="adm_u")
-        pw = st.text_input("Şifre", type="password", key="adm_p")
-        if st.button("Admin Giriş"):
-            if un == "admin02" and pw == "admin02":
-                st.session_state.logged_in = True
-                st.session_state.user_type = "ADMIN"
-                st.session_state.user_name = "Admin"
-                st.session_state.user_email = "admin@example.com"
-                st.session_state.user_id = 0
-                st.session_state.is_admin = 1
-                st.success("Admin girişi başarılı.")
-                st.rerun()
-            else:
-                st.error("Admin bilgisi hatalı.")
-
-    if not st.session_state.logged_in:
-        login_page()
+    init_db()
+    
+    if 'page' not in st.session_state:
+        st.session_state['page'] = 'login'
+    
+    if 'user_id' in st.session_state:
+        # GİRİŞ YAPILMIŞSA
+        if st.sidebar.button("Güvenli Çıkış"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+            
+        role = st.session_state['role']
+        if role == 'Öğrenci':
+            student_interface()
+        elif role == 'Öğretmen':
+            teacher_interface()
+        elif role == 'Veli':
+            parent_interface()
+        elif role == 'Yönetici':
+            admin_interface()
     else:
-        if st.session_state.user_type == "ÖĞRENCİ":
-            student_dashboard()
-        elif st.session_state.user_type == "ÖĞRETMEN":
-            teacher_dashboard()
-        elif st.session_state.user_type == "VELİ":
-            parent_dashboard()
-        elif st.session_state.user_type == "ADMIN":
-            admin_dashboard()
-        else:
+        # GİRİŞ YAPILMAMIŞSA
+        if st.session_state['page'] == 'login':
             login_page()
+        elif st.session_state['page'] == 'register':
+            register_page()
+        elif st.session_state['page'] == 'forgot_password':
+            forgot_password_page()
 
 if __name__ == "__main__":
     main()
